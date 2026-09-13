@@ -1859,6 +1859,8 @@ async def query_previous_session_balance(
 					f'[WARN] {account_name}: Previous session balance query failed '
 					f'({attempt}/{max_attempt_count}): {error}'
 				)
+				if 'WAF JS challenge' in error and previous_session.get('quota') is not None:
+					break
 			else:
 				print(
 					f'[WARN] {account_name}: Unable to prepare WAF cookies for previous-session balance query '
@@ -1953,6 +1955,8 @@ async def query_post_login_balance(
 					f'[WARN] {account_name}: Post-login balance query failed '
 					f'({attempt}/{max_attempt_count}): {error}'
 				)
+				if 'WAF JS challenge' in error:
+					break
 			else:
 				print(
 					f'[WARN] {account_name}: Unable to prepare WAF cookies for post-login balance query '
@@ -2030,18 +2034,31 @@ async def check_in_account(
 				login_result,
 			)
 			verified_user_info_after = user_info_after
-			if user_info_after is None and user_info_before and user_info_before.get('_checked_in_by_script_today'):
-				user_info_after = {
-					key: value for key, value in user_info_before.items() if not key.startswith('_')
-				}
-				print(f'[INFO] {account_name}: Reusing live balance because this script already checked in today')
+			if user_info_after is None:
+				if user_info_before:
+					user_info_after = {
+						key: value for key, value in user_info_before.items() if not key.startswith('_')
+					}
+					print(f'[INFO] {account_name}: Reusing live balance because post-login query was unavailable')
+				else:
+					cached_session = load_last_session(account_name)
+					if cached_session and cached_session.get('quota') is not None:
+						quota = float(cached_session['quota'])
+						used_quota = float(cached_session.get('used_quota') or 0.0)
+						user_info_after = {
+							'success': True,
+							'quota': quota,
+							'used_quota': used_quota,
+							'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+						}
+						print(f'[INFO] {account_name}: Recovered balance from verified session file: ${quota}')
 			if user_info_after and user_info_after.get('success'):
 				print(user_info_after.get('display', f':money: Current balance: ${user_info_after["quota"]}'))
 			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by {display_provider_name} OAuth login)')
 			_set_account_step(4, '保存状态')
-			if user_info_has_balance(verified_user_info_after):
+			if user_info_has_balance(user_info_after):
 				try:
-					save_last_session(account_name, all_cookies, resolved_api_user, balance=verified_user_info_after)
+					save_last_session(account_name, all_cookies, resolved_api_user, balance=user_info_after)
 				except TypeError:
 					save_last_session(account_name, all_cookies, resolved_api_user)
 			else:
