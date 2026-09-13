@@ -21,15 +21,30 @@ from rich.markup import escape
 from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
 
 if hasattr(sys.stdout, 'reconfigure'):
-	sys.stdout.reconfigure(line_buffering=True)
+	try:
+		sys.stdout.reconfigure(line_buffering=True, errors='replace')
+	except Exception:
+		pass
 if hasattr(sys.stderr, 'reconfigure'):
-	sys.stderr.reconfigure(line_buffering=True)
+	try:
+		sys.stderr.reconfigure(line_buffering=True, errors='replace')
+	except Exception:
+		pass
 
 # 并发签到按输出环境选择展示方式。交互终端使用 Rich 固定显示每个账号的进度，账号日志先缓冲。
 # 非交互日志实时输出账号前缀，并用心跳报告长时间运行的步骤。contextvars 会随 asyncio.to_thread
 # 进入浏览器和 HTTP 线程，因此 utils/browser.py 等模块里的 print 仍能归属到正确账号。
 _real_stdout = sys.stdout
 _stdout_lock = threading.Lock()
+
+
+def _safe_stdout_write(stream, data: str) -> int:
+	try:
+		return stream.write(data)
+	except UnicodeEncodeError:
+		encoding = getattr(stream, 'encoding', None) or 'utf-8'
+		safe_text = data.encode(encoding, errors='replace').decode(encoding)
+		return stream.write(safe_text)
 _current_log: contextvars.ContextVar = contextvars.ContextVar('checkin_current_log', default=None)
 _oauth_gate: contextvars.ContextVar[asyncio.Semaphore | None] = contextvars.ContextVar(
 	'checkin_oauth_gate', default=None
@@ -112,7 +127,7 @@ class _ContextStdout:
 	def write(self, data):
 		log = _current_log.get()
 		if log is None:
-			return _real_stdout.write(data)
+			return _safe_stdout_write(_real_stdout, data)
 		log.partial += data
 		lines = []
 		while '\n' in log.partial:
@@ -124,7 +139,7 @@ class _ContextStdout:
 				lines.append(f'{log.prefix}{line}\n')
 		if lines:
 			with _stdout_lock:
-				_real_stdout.write(''.join(lines))
+				_safe_stdout_write(_real_stdout, ''.join(lines))
 				_real_stdout.flush()
 		return len(data)
 
@@ -368,6 +383,7 @@ from utils.browser import (
 	login_with_email_form,
 	navigate_login_page,
 	prepare_browser_page,
+	read_browser_user_profile,
 	save_login_screenshot,
 	take_pending_screenshots,
 	verify_browser_login,
@@ -489,23 +505,34 @@ def load_last_session(account_name: str) -> dict | None:
 	if not isinstance(cookies, dict) or not cookies.get('session'):
 		return None
 	checkin_date = session.get('checkin_date')
-	return {
+	res = {
 		'cookies': cookies,
 		'api_user': api_user if isinstance(api_user, str) else None,
 		'checkin_date': checkin_date if isinstance(checkin_date, str) else None,
 	}
+	if 'quota' in session:
+		res['quota'] = session['quota']
+		res['used_quota'] = session.get('used_quota')
+	return res
 
 
-def save_last_session(account_name: str, cookies: dict, api_user: str | None) -> None:
+def save_last_session(account_name: str, cookies: dict, api_user: str | None, balance: dict | None = None) -> None:
 	session_cookie = cookies.get('session') if isinstance(cookies, dict) else None
 	if not session_cookie:
 		return
 	sessions = load_last_sessions()
-	sessions[account_name] = {
+	entry = {
 		'cookies': {'session': session_cookie},
 		'api_user': api_user,
 		'checkin_date': datetime.now().date().isoformat(),
 	}
+	if balance and isinstance(balance, dict) and 'quota' in balance:
+		entry['quota'] = balance.get('quota')
+		entry['used_quota'] = balance.get('used_quota')
+	elif account_name in sessions and 'quota' in sessions[account_name]:
+		entry['quota'] = sessions[account_name]['quota']
+		entry['used_quota'] = sessions[account_name].get('used_quota')
+	sessions[account_name] = entry
 	save_last_sessions(sessions)
 
 
@@ -857,6 +884,13 @@ async def perform_github_browser_login(
 		marker = read_profile_marker(provider_name, settings.browser_profile or account_name, profile_root=get_profile_root())
 		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else marker.get('api_user')
 		api_user = str(api_user) if api_user else None
+		if hasattr(page, 'evaluate'):
+			try:
+				browser_balance = await read_browser_user_profile(page, api_user=api_user)
+				if browser_balance:
+					user_profile = {**(user_profile or {}), **browser_balance}
+			except Exception as exc:
+				debug_print(f'[INFO] {account_name}: Could not read browser balance: {exc}')
 		print(f'[SUCCESS] {account_name}: GitHub browser login successful, got {len(all_cookies)} cookies')
 		await context.close()
 		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
@@ -1308,6 +1342,13 @@ async def perform_linuxdo_browser_login(
 		marker = read_profile_marker(provider_name, settings.browser_profile or account_name, profile_root=get_profile_root())
 		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else marker.get('api_user')
 		api_user = str(api_user) if api_user else None
+		if hasattr(page, 'evaluate'):
+			try:
+				browser_balance = await read_browser_user_profile(page, api_user=api_user)
+				if browser_balance:
+					user_profile = {**(user_profile or {}), **browser_balance}
+			except Exception as exc:
+				debug_print(f'[INFO] {account_name}: Could not read browser balance: {exc}')
 		print(f'[SUCCESS] {account_name}: LINUX DO browser login successful, got {len(all_cookies)} cookies')
 		await context.close()
 		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
@@ -1532,7 +1573,13 @@ def get_user_info(client, headers, user_info_url: str):
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
 		if response.status_code == 200:
-			data = response.json()
+			text = response.text or ''
+			if 'aliyun_waf' in text or '<!doctype html>' in text.lower():
+				return {'success': False, 'error': 'WAF JS challenge intercepted (HTML returned instead of JSON)'}
+			try:
+				data = response.json()
+			except Exception:
+				return {'success': False, 'error': 'Invalid JSON response from server'}
 			if data.get('success'):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
@@ -1822,6 +1869,20 @@ async def query_previous_session_balance(
 				print(f'[RETRY] {account_name}: retrying previous-session balance query')
 				await asyncio.sleep(1)
 
+		if previous_session.get('quota') is not None:
+			quota = float(previous_session['quota'])
+			used_quota = float(previous_session.get('used_quota') or 0.0)
+			cached_info = {
+				'success': True,
+				'quota': quota,
+				'used_quota': used_quota,
+				'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+			}
+			if previous_session.get('checkin_date') == datetime.now().date().isoformat():
+				cached_info['_checked_in_by_script_today'] = True
+			print(f'[INFO] {account_name}: Recovered previous balance from verified local session: ${quota}')
+			return cached_info
+
 		print(f'[WARN] {account_name}: Previous-session balance unavailable; check-in increment will be omitted')
 		return None
 
@@ -1899,6 +1960,10 @@ async def query_post_login_balance(
 				)
 			if attempt < max_attempt_count:
 				await asyncio.sleep(1)
+		browser_user_info = user_info_from_browser_profile(login_result.user_profile)
+		if user_info_has_balance(browser_user_info):
+			print(f'[INFO] {account_name}: Recovered post-login balance from browser session: ${browser_user_info["quota"]}')
+			return browser_user_info
 		print(f'[WARN] {account_name}: Check-in succeeded but post-login balance is unavailable')
 		return None
 
@@ -1975,7 +2040,10 @@ async def check_in_account(
 			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by {display_provider_name} OAuth login)')
 			_set_account_step(4, '保存状态')
 			if user_info_has_balance(verified_user_info_after):
-				save_last_session(account_name, all_cookies, resolved_api_user)
+				try:
+					save_last_session(account_name, all_cookies, resolved_api_user, balance=verified_user_info_after)
+				except TypeError:
+					save_last_session(account_name, all_cookies, resolved_api_user)
 			else:
 				print(f'[WARN] {account_name}: Keeping the last verified session because new balance was unavailable')
 			return True, user_info_before, user_info_after
