@@ -1173,13 +1173,20 @@ async def perform_direct_linuxdo_login(
 			account_name=account_name,
 		)
 
-		auth_url = await build_linuxdo_oauth_authorize_url(page, account_name)
-		if auth_url:
-			print(f'[SETUP] {account_name}: Navigating to LINUX DO OAuth authorization...')
-			await page.goto(auth_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
-		else:
-			print(f'[SETUP] {account_name}: Triggering LINUX DO login button...')
-			await click_linuxdo_login_entry(page, min(timeout_ms, 30_000), provider=provider_name, account_name=account_name)
+		print(f'[SETUP] {account_name}: Clicking LINUX DO login button...')
+		clicked_linuxdo = await click_linuxdo_login_entry(
+			page,
+			min(timeout_ms, 30_000),
+			provider=provider_name,
+			account_name=account_name,
+		)
+		if not clicked_linuxdo:
+			auth_url = await build_linuxdo_oauth_authorize_url(page, account_name)
+			if auth_url:
+				print(f'[SETUP] {account_name}: Navigating to LINUX DO OAuth authorization fallback...')
+				await page.goto(auth_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
+			else:
+				print(f'[WARN] {account_name}: Unable to trigger LINUX DO login')
 
 		print('[SETUP] Please complete LINUX DO login and click "允许" (Authorize) in the browser window.')
 		deadline = time.monotonic() + timeout_ms / 1000
@@ -1188,9 +1195,6 @@ async def perform_direct_linuxdo_login(
 			for current_page in list(context.pages):
 				if current_page.is_closed():
 					continue
-
-				if 'connect.linux.do/oauth2/authorize' in current_page.url:
-					await confirm_linuxdo_oauth(current_page, 2_000)
 
 				current_url = current_page.url.lower()
 				if provider_config.domain in current_url:
@@ -1273,14 +1277,12 @@ async def perform_linuxdo_browser_login(
 		)
 		oauth_page = next((candidate for candidate in context.pages if candidate not in pages_before_oauth), None)
 		if clicked_linuxdo and oauth_page is None:
-			try:
-				await page.wait_for_url(
-					lambda url: not (provider_config.domain in str(url) and '/login' in str(url)),
-					timeout=min(timeout_ms, 3_000),
-				)
-			except Exception:  # nosec B110
-				pass
-			oauth_page = next((candidate for candidate in context.pages if candidate not in pages_before_oauth), None)
+			popup_deadline = time.monotonic() + min(timeout_ms / 1000, 8.0)
+			while time.monotonic() < popup_deadline:
+				oauth_page = next((candidate for candidate in context.pages if candidate not in pages_before_oauth), None)
+				if oauth_page is not None:
+					break
+				await asyncio.sleep(0.5)
 		if oauth_page is not None:
 			print(f'[INFO] {account_name}: LINUX DO OAuth opened in a new browser page')
 			post_state_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)

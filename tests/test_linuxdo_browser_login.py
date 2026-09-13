@@ -150,9 +150,14 @@ async def test_direct_linuxdo_login_detects_session_token(monkeypatch, tmp_path)
 		calls['sleep'] = seconds
 		context.page.url = 'https://agentrouter.org/console'
 
+	async def fake_click_linuxdo_login_entry(page, timeout, *, provider, account_name):
+		calls['click_linuxdo'] = True
+		return True
+
 	monkeypatch.setattr(checkin, 'launch_login_context', fake_launch_login_context)
 	monkeypatch.setattr(checkin, 'prepare_browser_page', fake_prepare_browser_page)
 	monkeypatch.setattr(checkin, 'navigate_login_page', fake_navigate_login_page)
+	monkeypatch.setattr(checkin, 'click_linuxdo_login_entry', fake_click_linuxdo_login_entry)
 	monkeypatch.setattr(checkin, 'build_linuxdo_oauth_authorize_url', fake_build_linuxdo_oauth_authorize_url)
 	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie, raising=False)
 	monkeypatch.setattr(checkin, 'verify_browser_login', fake_verify_browser_login)

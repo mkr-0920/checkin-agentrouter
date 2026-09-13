@@ -48,9 +48,13 @@ GITHUB_LOGIN_ENTRY_SELECTORS = (
 	'a[href*="github" i]',
 )
 LINUXDO_LOGIN_ENTRY_SELECTORS = (
+	'button:has(#linuxdo_icon)',
+	'button:has([data-name="linuxdo_icon"])',
+	'.semi-card button:has-text("LinuxDO")',
 	'.semi-card button:has-text("LINUX DO")',
 	'.semi-card button:has-text("Linux Do")',
 	'.semi-card button:has-text("Linuxdo")',
+	'button:has-text("LinuxDO")',
 	'button:has-text("LINUX DO")',
 	'button:has-text("Linux Do")',
 	'a[href*="linuxdo" i]',
