@@ -354,9 +354,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from utils.browser import (
+	CONSOLE_PATH,
 	BrowserLoginResult,
 	click_github_login_entry,
+	click_linuxdo_login_entry,
 	confirm_github_oauth,
+	confirm_linuxdo_oauth,
 	get_session_cookie_value,
 	has_session_cookie,
 	is_logged_in,
@@ -376,12 +379,14 @@ from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
 from utils.profiles import (
 	delete_profile,
+	get_profile_auth_type,
 	get_profile_status,
 	is_profile_dir_verified,
 	list_profile_names,
 	mark_profile_dir_valid,
 	mark_profile_expired,
 	mark_profile_verified,
+	read_profile_marker,
 	validate_profile_name,
 )
 from utils.proxy import get_playwright_proxy, get_proxy_server
@@ -392,6 +397,8 @@ DEFAULT_PROFILE_PROVIDER = 'agentrouter'
 CLI_COMMAND = 'checkin-agentrouter'
 GITHUB_LOGIN_URL = 'https://github.com/login'
 GITHUB_PROFILE_URL = 'https://github.com/settings/profile'
+LINUXDO_CONNECT_URL = 'https://connect.linux.do'
+LINUXDO_DEFAULT_CLIENT_ID = 'KZUecGfhhDZMVnv8UtEdhOhf9sNOhqVX'
 NOTIFICATION_TITLE = 'AgentRouter Check-in'
 
 
@@ -738,6 +745,13 @@ def _github_profile_requires_login(oauth_page) -> bool:
 	return oauth_page is not None and not oauth_page.is_closed() and oauth_page.url.startswith(GITHUB_LOGIN_URL)
 
 
+def _linuxdo_profile_requires_login(oauth_page) -> bool:
+	if oauth_page is None or oauth_page.is_closed():
+		return False
+	url = oauth_page.url.lower()
+	return '/login' in url or 'linux.do/session/new' in url
+
+
 async def perform_github_browser_login(
 	account_name: str,
 	provider_config,
@@ -840,7 +854,9 @@ async def perform_github_browser_login(
 			print(f'[FAILED] {account_name}: GitHub browser login did not produce a provider session cookie')
 			await context.close()
 			return None
-		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else None
+		marker = read_profile_marker(provider_name, settings.browser_profile or account_name, profile_root=get_profile_root())
+		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else marker.get('api_user')
+		api_user = str(api_user) if api_user else None
 		print(f'[SUCCESS] {account_name}: GitHub browser login successful, got {len(all_cookies)} cookies')
 		await context.close()
 		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
@@ -910,6 +926,39 @@ async def build_github_oauth_authorize_url(page, account_name: str) -> str | Non
 			'client_id': str(client_id),
 			'state': str(state),
 			'scope': 'user:email',
+		}
+	)
+
+
+async def build_linuxdo_oauth_authorize_url(page, account_name: str) -> str | None:
+	"""按 AgentRouter 前端流程构造 LINUX DO OAuth 授权 URL。"""
+	try:
+		oauth_data = await page.evaluate(
+			"""async () => {
+				const status = JSON.parse(localStorage.getItem('status') || '{}');
+				const clientId = status.linuxdo_client_id || 'KZUecGfhhDZMVnv8UtEdhOhf9sNOhqVX';
+				const response = await fetch('/api/oauth/state?mode=login', { cache: 'no-store' });
+				const data = await response.json();
+				if (!data || !data.success || !data.data) return null;
+				return { clientId, state: data.data };
+			}"""
+		)
+	except Exception as exc:
+		print(f'[WARN] {account_name}: Unable to build LINUX DO OAuth URL from page state: {exc}')
+		return None
+
+	if not isinstance(oauth_data, dict):
+		return None
+	client_id = oauth_data.get('clientId')
+	state = oauth_data.get('state')
+	if not client_id or not state:
+		return None
+
+	return 'https://connect.linux.do/oauth2/authorize?' + urlencode(
+		{
+			'response_type': 'code',
+			'client_id': str(client_id),
+			'state': str(state),
 		}
 	)
 
@@ -1006,15 +1055,19 @@ async def login_with_github_browser(
 			print(f'[WARN] {account_name}: GitHub login attempt failed; profile status unchanged')
 		return None
 	if result.api_user is None:
+		marker = read_profile_marker(provider_name, profile_name, profile_root=get_profile_root())
 		previous_session = load_last_session(account_name)
-		previous_api_user = previous_session.get('api_user') if previous_session else None
+		previous_api_user = (
+			(previous_session.get('api_user') if previous_session else None)
+			or marker.get('api_user')
+		)
 		if previous_api_user:
 			result = BrowserLoginResult(
 				cookies=result.cookies,
 				api_user=str(previous_api_user),
 				user_profile=result.user_profile,
 			)
-			print(f'[INFO] {account_name}: Reusing API user id from previous successful session')
+			print(f'[INFO] {account_name}: Reusing API user id from previous session or profile')
 	mark_profile_dir_valid(settings.profile_dir)
 	return result
 
@@ -1048,6 +1101,304 @@ async def setup_github_browser_profile(
 	return await perform_direct_github_login(
 		profile_name,
 		provider_name,
+		settings,
+		use_proxy=provider_config.use_proxy,
+	)
+
+
+async def perform_direct_linuxdo_login(
+	account_name: str,
+	provider_name: str,
+	provider_config,
+	settings,
+	*,
+	use_proxy: bool = False,
+) -> BrowserLoginResult | None:
+	"""通过 OAuth 授权闭环完成 LINUX DO 登录并验证 AgentRouter 绑定。"""
+	timeout_ms = settings.wait_timeout_ms
+
+	try:
+		context = await launch_login_context(settings, use_proxy=use_proxy)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return None
+
+	page = None
+	try:
+		page = await context.new_page()
+		await reset_provider_auth_state(context, page, provider_config, account_name)
+		await prepare_browser_page(page)
+
+		login_url = f'{provider_config.domain}{provider_config.login_path}'
+		print(f'[SETUP] {account_name}: Opening login page: {login_url}')
+		await navigate_login_page(
+			page,
+			login_url,
+			timeout_ms,
+			provider=provider_name,
+			account_name=account_name,
+		)
+
+		auth_url = await build_linuxdo_oauth_authorize_url(page, account_name)
+		if auth_url:
+			print(f'[SETUP] {account_name}: Navigating to LINUX DO OAuth authorization...')
+			await page.goto(auth_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
+		else:
+			print(f'[SETUP] {account_name}: Triggering LINUX DO login button...')
+			await click_linuxdo_login_entry(page, min(timeout_ms, 30_000), provider=provider_name, account_name=account_name)
+
+		print('[SETUP] Please complete LINUX DO login and click "允许" (Authorize) in the browser window.')
+		deadline = time.monotonic() + timeout_ms / 1000
+
+		while time.monotonic() < deadline:
+			for current_page in list(context.pages):
+				if current_page.is_closed():
+					continue
+
+				if 'connect.linux.do/oauth2/authorize' in current_page.url:
+					await confirm_linuxdo_oauth(current_page, 2_000)
+
+				current_url = current_page.url.lower()
+				if provider_config.domain in current_url:
+					if CONSOLE_PATH in current_url or '/oauth/linuxdo' in current_url:
+						has_session = await wait_for_session_cookie(
+							current_page,
+							timeout_ms=10_000,
+							cookie_url=provider_config.domain,
+						)
+						console_url = f'{provider_config.domain}/console'
+						user_profile = await verify_browser_login(current_page, console_url, 30_000)
+						if user_profile or has_session:
+							all_cookies = {
+								c['name']: c['value']
+								for c in await context.cookies()
+								if c.get('name') and c.get('value')
+							}
+							user_id = user_profile.get('id') if user_profile else None
+							username = user_profile.get('username') if user_profile else account_name
+							print(f'[SUCCESS] {account_name}: LINUX DO login and authorization verified! (User: {username}, ID: {user_id})')
+							await context.close()
+							return BrowserLoginResult(
+								cookies=all_cookies,
+								api_user=str(user_id) if user_id else None,
+								user_profile=user_profile,
+							)
+
+			await asyncio.sleep(1)
+
+		print(f'[FAILED] {account_name}: LINUX DO login was not verified before timeout')
+		await save_login_screenshot(page, provider_name, account_name, 'linuxdo-direct-login-timeout')
+		await context.close()
+		return None
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error during direct LINUX DO login: {e}')
+		if page is not None and not page.is_closed():
+			await save_login_screenshot(page, provider_name, account_name, 'linuxdo-direct-login-error')
+		await context.close()
+		return None
+
+
+async def perform_linuxdo_browser_login(
+	account_name: str,
+	provider_config,
+	provider_name: str,
+	settings,
+) -> BrowserLoginResult | None:
+	"""使用指定持久浏览器 profile 走 LINUX DO OAuth 登录。"""
+	timeout_ms = settings.wait_timeout_ms
+
+	try:
+		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return None
+
+	page = None
+	try:
+		page = await context.new_page()
+		await reset_provider_auth_state(context, page, provider_config, account_name)
+		await prepare_browser_page(page)
+
+		login_url = f'{provider_config.domain}{provider_config.login_path}'
+		print(f'[INFO] {account_name}: Opening login page for LINUX DO OAuth: {login_url}')
+		await navigate_login_page(
+			page,
+			login_url,
+			timeout_ms,
+			provider=provider_name,
+			account_name=account_name,
+		)
+		initial_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
+		pages_before_oauth = tuple(context.pages)
+		clicked_linuxdo = await click_linuxdo_login_entry(
+			page,
+			min(timeout_ms, 30_000),
+			provider=provider_name,
+			account_name=account_name,
+		)
+		oauth_page = next((candidate for candidate in context.pages if candidate not in pages_before_oauth), None)
+		if clicked_linuxdo and oauth_page is None:
+			try:
+				await page.wait_for_url(
+					lambda url: not (provider_config.domain in str(url) and '/login' in str(url)),
+					timeout=min(timeout_ms, 3_000),
+				)
+			except Exception:  # nosec B110
+				pass
+			oauth_page = next((candidate for candidate in context.pages if candidate not in pages_before_oauth), None)
+		if oauth_page is not None:
+			print(f'[INFO] {account_name}: LINUX DO OAuth opened in a new browser page')
+			post_state_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
+			if await confirm_linuxdo_oauth(oauth_page, min(timeout_ms, 10_000)):
+				initial_session_cookie = post_state_session_cookie
+				print(f'[INFO] {account_name}: Confirmed LINUX DO OAuth authorization')
+
+		still_on_provider_login = provider_config.domain in page.url and '/login' in page.url
+		if not clicked_linuxdo or (oauth_page is None and still_on_provider_login):
+			auth_url = await build_linuxdo_oauth_authorize_url(page, account_name)
+			if not auth_url:
+				auth_url = f'{provider_config.domain}/api/oauth/linuxdo'
+			print(f'[WARN] {account_name}: LINUX DO OAuth was not triggered from login page, falling back to {auth_url}')
+			initial_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
+			await page.goto(auth_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
+			if 'connect.linux.do' in page.url:
+				if await confirm_linuxdo_oauth(page, min(timeout_ms, 10_000)):
+					print(f'[INFO] {account_name}: Confirmed LINUX DO OAuth authorization on current page')
+
+		session_cookie_changed = await wait_for_session_cookie(
+			page,
+			min(timeout_ms, 12_000),
+			cookie_url=provider_config.domain,
+			previous_value=initial_session_cookie,
+		)
+		if not session_cookie_changed:
+			print(f'[WARN] {account_name}: Provider session cookie was not observed before verification')
+		target_oauth_page = oauth_page or page
+		oauth_callback_completed = _oauth_callback_completed(target_oauth_page, page, provider_config.domain)
+		linuxdo_login_required = _linuxdo_profile_requires_login(target_oauth_page)
+		if linuxdo_login_required:
+			profile_name = settings.browser_profile or account_name
+			mark_profile_expired(provider_name, profile_name, profile_root=get_profile_root())
+			print(f'[FAILED] {account_name}: Saved LINUX DO profile requires login')
+			print(f'[HINT] Run: {CLI_COMMAND} add {profile_name} --type linuxdo')
+			await save_login_screenshot(target_oauth_page, provider_name, account_name, 'linuxdo-profile-login-required')
+			await context.close()
+			return None
+		session_verified = session_cookie_changed and oauth_callback_completed
+
+		console_url = f'{provider_config.domain}/console'
+		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+		if not user_profile and not session_verified:
+			print(f'[FAILED] {account_name}: LINUX DO browser login failed - /api/user/self not verified')
+			await save_login_screenshot(page, provider_name, account_name, 'linuxdo-browser-not-authenticated')
+			await context.close()
+			return None
+		if not user_profile:
+			print(f'[INFO] {account_name}: LINUX DO OAuth verified by completed callback and new session cookie')
+
+		cookies = await context.cookies()
+		all_cookies = {
+			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
+		}
+		if not all_cookies.get('session'):
+			print(f'[FAILED] {account_name}: LINUX DO browser login did not produce a provider session cookie')
+			await context.close()
+			return None
+		marker = read_profile_marker(provider_name, settings.browser_profile or account_name, profile_root=get_profile_root())
+		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else marker.get('api_user')
+		api_user = str(api_user) if api_user else None
+		print(f'[SUCCESS] {account_name}: LINUX DO browser login successful, got {len(all_cookies)} cookies')
+		await context.close()
+		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error during LINUX DO browser login: {e}')
+		if page is not None:
+			await save_login_screenshot(page, provider_name, account_name, 'linuxdo-browser-login-error')
+		await context.close()
+		return None
+
+
+async def login_with_linuxdo_browser(
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+	provider_name: str,
+) -> BrowserLoginResult | None:
+	"""使用已保存的本地浏览器 profile 走 LINUX DO OAuth 登录。"""
+	print(f'[PROCESSING] {account_name}: Logging in with saved LINUX DO browser profile...')
+	profile_name = account.browser_profile or account_name
+	settings = load_browser_login_settings(
+		account_name,
+		provider_name,
+		persist_profile=True,
+		browser_profile=profile_name,
+	)
+	if not settings.profile_dir.exists():
+		print(f'[FAILED] {account_name}: Browser profile "{profile_name}" not found')
+		print(f'[HINT] Run: {CLI_COMMAND} add {profile_name} --type linuxdo')
+		return None
+	if not is_profile_dir_verified(settings.profile_dir):
+		print(f'[FAILED] {account_name}: Browser profile "{profile_name}" has not been verified')
+		print(f'[HINT] Run: {CLI_COMMAND} add {profile_name} --type linuxdo')
+		return None
+
+	result = await perform_linuxdo_browser_login(account_name, provider_config, provider_name, settings)
+	if not result:
+		if get_profile_status(provider_name, profile_name, profile_root=get_profile_root()) == 'expired':
+			print(f'[WARN] {account_name}: LINUX DO profile is expired')
+		else:
+			print(f'[WARN] {account_name}: LINUX DO login attempt failed; profile status unchanged')
+		return None
+	if result.api_user is None:
+		marker = read_profile_marker(provider_name, profile_name, profile_root=get_profile_root())
+		previous_session = load_last_session(account_name)
+		previous_api_user = (
+			(previous_session.get('api_user') if previous_session else None)
+			or marker.get('api_user')
+		)
+		if previous_api_user:
+			result = BrowserLoginResult(
+				cookies=result.cookies,
+				api_user=str(previous_api_user),
+				user_profile=result.user_profile,
+			)
+			print(f'[INFO] {account_name}: Reusing API user id from previous session or profile')
+	mark_profile_dir_valid(settings.profile_dir)
+	return result
+
+
+async def setup_linuxdo_browser_profile(
+	profile_name: str,
+	provider_config,
+	provider_name: str,
+) -> BrowserLoginResult | None:
+	"""覆盖并重新创建一个本地 LINUX DO 浏览器登录 profile。"""
+	profile_name = validate_profile_name(profile_name)
+	print(f'[SETUP] Recreating browser profile "{profile_name}" for {provider_name} (LINUX DO)')
+	settings = load_browser_login_settings(
+		profile_name,
+		provider_name,
+		persist_profile=True,
+		browser_profile=profile_name,
+		reset_profile=True,
+	)
+	settings = settings.__class__(
+		headless=False,
+		humanize=settings.humanize,
+		wait_timeout_ms=max(settings.wait_timeout_ms, 300_000),
+		profile_dir=settings.profile_dir,
+		cloakbrowser_binary_path=settings.cloakbrowser_binary_path,
+		persist_profile=settings.persist_profile,
+		browser_profile=settings.browser_profile,
+	)
+	print(f'[SETUP] Browser profile path: {settings.profile_dir}')
+	print('[SETUP] Please complete LINUX DO login in the browser window. The script will save it after verification.')
+	return await perform_direct_linuxdo_login(
+		profile_name,
+		provider_name,
+		provider_config,
 		settings,
 		use_proxy=provider_config.use_proxy,
 	)
@@ -1088,6 +1439,8 @@ def run_profile_list(provider_name: str = DEFAULT_PROFILE_PROVIDER) -> int:
 			source.append('saved')
 		if profile_status != 'missing':
 			source.append(profile_status)
+		auth_type = get_profile_auth_type(provider_name, name, profile_root=profile_root)
+		source.append(auth_type)
 		print(f'  {status} {name}  ({", ".join(source)})')
 	return 0
 
@@ -1111,12 +1464,17 @@ def run_profile_delete(provider_name: str, profile_name: str) -> int:
 	return 0
 
 
-async def run_profile_add(provider_name: str, profile_name: str) -> int:
-	"""覆盖创建指定浏览器 profile，并等待用户完成 GitHub 登录。"""
+async def run_profile_add(provider_name: str, profile_name: str, auth_type: str = 'github') -> int:
+	"""覆盖创建指定浏览器 profile，并等待用户完成 GitHub 或 LINUX DO 登录。"""
 	try:
 		profile_name = validate_profile_name(profile_name)
 	except ValueError as exc:
 		print(f'[FAILED] {exc}')
+		return 2
+
+	auth_type = auth_type.strip().lower() if auth_type else 'github'
+	if auth_type not in {'github', 'linuxdo'}:
+		print(f'[FAILED] Unsupported auth type "{auth_type}", must be "github" or "linuxdo"')
 		return 2
 
 	if get_profile_status(provider_name, profile_name, profile_root=get_profile_root()) == 'valid':
@@ -1132,7 +1490,11 @@ async def run_profile_add(provider_name: str, profile_name: str) -> int:
 		print(f'[FAILED] Provider "{provider_name}" not found in configuration')
 		return 1
 
-	result = await setup_github_browser_profile(profile_name, provider_config, provider_name)
+	if auth_type == 'linuxdo':
+		result = await setup_linuxdo_browser_profile(profile_name, provider_config, provider_name)
+	else:
+		result = await setup_github_browser_profile(profile_name, provider_config, provider_name)
+
 	if not result:
 		print(f'[FAILED] Browser profile "{profile_name}" was not verified. Please run add again.')
 		return 1
@@ -1141,6 +1503,7 @@ async def run_profile_add(provider_name: str, profile_name: str) -> int:
 		'profile': profile_name,
 		'api_user': result.api_user,
 		'status': 'valid',
+		'auth_type': auth_type,
 		'verified_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
 	}
 	mark_profile_verified(
@@ -1157,10 +1520,10 @@ async def run_profile_add(provider_name: str, profile_name: str) -> int:
 
 def print_usage() -> None:
 	print('Usage:')
-	print(f'  {CLI_COMMAND}                 Run daily check-in')
-	print(f'  {CLI_COMMAND} add <name>      Recreate and save a GitHub browser profile')
-	print(f'  {CLI_COMMAND} list            List configured and saved browser profiles')
-	print(f'  {CLI_COMMAND} delete <name>   Delete a saved browser profile')
+	print(f'  {CLI_COMMAND}                                   Run daily check-in')
+	print(f'  {CLI_COMMAND} add <name> [--type github|linuxdo] Recreate and save a browser profile')
+	print(f'  {CLI_COMMAND} list                              List configured and saved browser profiles')
+	print(f'  {CLI_COMMAND} delete <name>                     Delete a saved browser profile')
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -1574,19 +1937,26 @@ async def check_in_account(
 		if query_previous_balance:
 			user_info_before = await query_previous_session_balance(account, account_index, app_config)
 
+		profile_name = account.browser_profile or account_name
+		auth_type = get_profile_auth_type(account.provider, profile_name, profile_root=get_profile_root())
+		oauth_label = 'LINUX DO OAuth 登录' if auth_type == 'linuxdo' else 'GitHub OAuth 登录'
+		login_func = login_with_linuxdo_browser if auth_type == 'linuxdo' else login_with_github_browser
+		auth_method_name = 'linuxdo browser' if auth_type == 'linuxdo' else 'github browser'
+		display_provider_name = 'LINUX DO' if auth_type == 'linuxdo' else 'GitHub'
+
 		oauth_gate = _oauth_gate.get()
 		if oauth_gate is None:
-			_set_account_step(2, 'GitHub OAuth 登录')
-			login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
+			_set_account_step(2, oauth_label)
+			login_result = await login_func(account, account_name, provider_config, account.provider)
 		else:
 			_set_account_step(2, '等待 OAuth 槽位')
 			async with oauth_gate:
-				_set_account_step(2, 'GitHub OAuth 登录')
-				login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
+				_set_account_step(2, oauth_label)
+				login_result = await login_func(account, account_name, provider_config, account.provider)
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
-			auth_method = 'github browser'
+			auth_method = auth_method_name
 			_set_account_step(3, '查询签到后余额')
 			user_info_after = await query_post_login_balance(
 				account,
@@ -1602,7 +1972,7 @@ async def check_in_account(
 				print(f'[INFO] {account_name}: Reusing live balance because this script already checked in today')
 			if user_info_after and user_info_after.get('success'):
 				print(user_info_after.get('display', f':money: Current balance: ${user_info_after["quota"]}'))
-			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')
+			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by {display_provider_name} OAuth login)')
 			_set_account_step(4, '保存状态')
 			if user_info_has_balance(verified_user_info_after):
 				save_last_session(account_name, all_cookies, resolved_api_user)
@@ -1610,7 +1980,7 @@ async def check_in_account(
 				print(f'[WARN] {account_name}: Keeping the last verified session because new balance was unavailable')
 			return True, user_info_before, user_info_after
 		else:
-			print(f'[FAILED] {account_name}: GitHub browser login failed, will not use stale session cookies')
+			print(f'[FAILED] {account_name}: {display_provider_name} browser login failed, will not use stale session cookies')
 			return False, user_info_before, None
 	elif account.has_login_credentials():
 		_set_account_step(1, '准备账号')
@@ -2005,8 +2375,20 @@ def run_main():
 			return
 
 		command = args[0]
-		if command == 'add' and len(args) == 2:
-			sys.exit(asyncio.run(run_profile_add(DEFAULT_PROFILE_PROVIDER, args[1])))
+		if command == 'add':
+			auth_type = 'github'
+			if len(args) == 2:
+				profile_name = args[1]
+			elif len(args) == 3 and args[2].lower() in {'github', 'linuxdo'}:
+				profile_name = args[1]
+				auth_type = args[2].lower()
+			elif len(args) == 4 and args[2].lower() in {'--type', '-t'} and args[3].lower() in {'github', 'linuxdo'}:
+				profile_name = args[1]
+				auth_type = args[3].lower()
+			else:
+				print_usage()
+				sys.exit(2)
+			sys.exit(asyncio.run(run_profile_add(DEFAULT_PROFILE_PROVIDER, profile_name, auth_type=auth_type)))
 		if command == 'list' and len(args) == 1:
 			sys.exit(run_profile_list(DEFAULT_PROFILE_PROVIDER))
 		if command == 'delete' and len(args) == 2:

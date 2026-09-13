@@ -73,6 +73,11 @@ def get_profile_status(provider: str, profile_name: str, *, profile_root: Path |
 	return str(marker.get('status') or 'valid') if marker else 'missing'
 
 
+def get_profile_auth_type(provider: str, profile_name: str, *, profile_root: Path | None = None) -> str:
+	marker = read_profile_marker(provider, profile_name, profile_root=profile_root)
+	return str(marker.get('auth_type') or 'github')
+
+
 def is_profile_expired(provider: str, profile_name: str, *, profile_root: Path | None = None) -> bool:
 	return get_profile_status(provider, profile_name, profile_root=profile_root) == 'expired'
 

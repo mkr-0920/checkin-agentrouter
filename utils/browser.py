@@ -30,6 +30,10 @@ GITHUB_LOGIN_BUTTON_NAMES = (
 	re.compile(r'GitHub', re.I),
 	re.compile(r'Github', re.I),
 )
+LINUXDO_LOGIN_BUTTON_NAMES = (
+	re.compile(r'Linux\s*Do', re.I),
+	re.compile(r'Linuxdo', re.I),
+)
 EMAIL_LOGIN_ENTRY_SELECTORS = (
 	'.semi-card button:has(.semi-icon-mail):not(form.semi-form button)',
 	'.semi-card button:has([aria-label="mail"]):not(form.semi-form button)',
@@ -42,6 +46,15 @@ GITHUB_LOGIN_ENTRY_SELECTORS = (
 	'button:has(.semi-icon-github)',
 	'button:has([aria-label*="github" i])',
 	'a[href*="github" i]',
+)
+LINUXDO_LOGIN_ENTRY_SELECTORS = (
+	'.semi-card button:has-text("LINUX DO")',
+	'.semi-card button:has-text("Linux Do")',
+	'.semi-card button:has-text("Linuxdo")',
+	'button:has-text("LINUX DO")',
+	'button:has-text("Linux Do")',
+	'a[href*="linuxdo" i]',
+	'a[href*="linux.do" i]',
 )
 LOGIN_PAGE_READY_SELECTORS = (
 	'.semi-card button:has(.semi-icon-mail)',
@@ -1026,5 +1039,87 @@ async def confirm_github_oauth(page: Page, timeout_ms: int = 10_000) -> bool:
 				return True
 		except Exception as exc:  # nosec B110
 			debug_print(f'[INFO] GitHub OAuth confirmation button check failed: {exc}')
+		await asyncio.sleep(0.2)
+	return False
+
+
+async def click_linuxdo_login_entry(
+	page: Page,
+	timeout_ms: int,
+	*,
+	provider: str = '',
+	account_name: str = '',
+) -> bool:
+	"""在登录页点击 LINUX DO 登录入口。"""
+	deadline = time.monotonic() + timeout_ms / 1000
+
+	try:
+		await _wait_for_login_page_ready(page, min(timeout_ms, WAF_READY_TIMEOUT_MS))
+	except Exception:  # nosec B110
+		pass
+
+	while time.monotonic() < deadline:
+		await _dismiss_blocking_overlays(page)
+
+		for selector in LINUXDO_LOGIN_ENTRY_SELECTORS:
+			locators = page.locator(selector)
+			try:
+				count = await locators.count()
+			except Exception:  # nosec B112
+				continue
+			for index in range(count):
+				button = locators.nth(index)
+				try:
+					if await button.is_visible() and await _click_locator(button):
+						return True
+				except Exception:  # nosec B112
+					continue
+
+		for pattern in LINUXDO_LOGIN_BUTTON_NAMES:
+			for scope in (page.locator('.semi-card'), page):
+				try:
+					button = scope.get_by_role('button', name=pattern).first
+					if await button.is_visible() and await _click_locator(button):
+						return True
+				except Exception:  # nosec B112
+					continue
+
+		await asyncio.sleep(0.5)
+
+	debug_print(f'[INFO] LINUX DO login entry not found on {page.url}')
+	if provider and account_name:
+		await save_login_screenshot(page, provider, account_name, 'linuxdo-entry-timeout')
+	return False
+
+
+async def confirm_linuxdo_oauth(page: Page, timeout_ms: int = 10_000) -> bool:
+	"""在 LINUX DO OAuth 确认页点击 '允许'。"""
+	action_timeout = min(timeout_ms, FORM_ACTION_TIMEOUT_MS)
+	deadline = time.monotonic() + action_timeout / 1000
+	while time.monotonic() < deadline:
+		if page.is_closed():
+			return False
+		if page.url != 'about:blank' and 'connect.linux.do/oauth2/authorize' not in page.url:
+			return False
+
+		# HAR 抓包提取特征：<a href="/oauth2/approve/..." class="btn-pill btn-pill-primary">允许</a>
+		for selector in (
+			'a[href*="/oauth2/approve/"]',
+			'.oauth-actions a.btn-pill-primary',
+			'a:has-text("允许")',
+			'button:has-text("允许")',
+			'a:has-text("Approve")',
+			'button:has-text("Approve")',
+			'a:has-text("Authorize")',
+			'button:has-text("Authorize")',
+		):
+			try:
+				locator = page.locator(selector).first
+				if await locator.is_visible():
+					await locator.click(timeout=action_timeout)
+					return True
+			except Exception as exc:  # nosec B110
+				debug_print(f'[INFO] LINUX DO OAuth confirmation click check failed: {exc}')
+
 		await asyncio.sleep(0.2)
 	return False

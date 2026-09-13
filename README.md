@@ -7,8 +7,9 @@ English summary: Local AgentRouter daily check-in automation with multi-account 
 ## 功能
 
 - 多个 AgentRouter 账号并行执行
-- 每个账号独立保存 GitHub 登录状态
-- 每次重新 GitHub OAuth，可靠触发每日签到
+- 支持 GitHub OAuth 与 LINUX DO OAuth 两种登录方式
+- 每个账号独立保存第三方登录状态
+- 每次重新 OAuth，可靠触发每日签到
 - 签到前、签到后余额分别重试，不因余额查询失败重复 OAuth
 - 交互终端使用实时多账号进度条
 - 非交互终端使用普通逐行日志，适合 `launchd` 和日志文件
@@ -77,13 +78,19 @@ curl -I --proxy http://127.0.0.1:7890 https://agentrouter.org
 
 ### 3. 添加账号
 
+支持添加 **GitHub** 账号或 **LINUX DO** 账号：
+
 ```bash
+# 添加 GitHub 账号（默认）
 uv run python checkin.py add main
+
+# 添加 LINUX DO 账号（指定 --type linuxdo）
+uv run python checkin.py add main-linuxdo --type linuxdo
 ```
 
-浏览器打开后，在该浏览器中完成 GitHub 登录。需要二次验证时也在同一窗口完成。脚本确认登录成功后会保存该账号，并把 `main` 写入 `.env`。
+浏览器打开后，在该浏览器中完成对应的第三方平台登录（GitHub 或 LINUX DO）。脚本确认登录成功后会保存该账号 profile，并把账号名称写入 `.env`。
 
-`main` 只是本地显示名称，不需要与 GitHub 用户名相同。添加第二个账号时，要在新窗口中确认登录的是目标 GitHub 账号。
+`main` 只是本地显示名称，不需要与平台用户名相同。添加多个账号时使用不同名称。
 
 添加完成后检查状态：
 
@@ -94,13 +101,8 @@ uv run python checkin.py list
 正常结果应包含：
 
 ```text
-✅ main  (configured, saved, valid)
-```
-
-每个名称对应一个 GitHub 账号。添加其他账号时使用不同名称：
-
-```bash
-uv run python checkin.py add backup
+✅ main          (configured, saved, valid, github)
+✅ main-linuxdo  (configured, saved, valid, linuxdo)
 ```
 
 ### 4. 执行签到
@@ -203,7 +205,8 @@ spare   ━━━━━━━━━━━━━━━━━━ step 0/4         
 添加或重新登录：
 
 ```bash
-checkin-agentrouter add main
+checkin-agentrouter add main                       # 添加/重登 GitHub 账号
+checkin-agentrouter add main-linuxdo --type linuxdo  # 添加/重登 LINUX DO 账号
 ```
 
 查看状态：
@@ -222,10 +225,11 @@ checkin-agentrouter delete main
 
 | 状态 | 含义 |
 | --- | --- |
-| `valid` | GitHub 登录有效，可以正常签到 |
-| `expired` | GitHub 登录已失效，需要重新执行 `add` |
+| `valid` | 第三方登录有效，可以正常签到 |
+| `expired` | 第三方登录已失效，需要重新执行 `add` |
 | `saved` | 本地账号数据存在 |
 | `configured` | 账号名称已写入 `.env` |
+| `github` / `linuxdo` | 账号所使用的 OAuth 认证协议 |
 
 网络错误、WAF 失败、HTTP 429 或 OAuth 临时失败不会把账号标记为 `expired`。重新登录成功后会自动恢复为 `valid`。
 

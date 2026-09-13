@@ -238,3 +238,25 @@ async def test_check_in_account_passes_browser_profile_to_github_login(monkeypat
 	assert calls['login'] == ('profile_main', 'github-account', 'agentrouter', 'agentrouter')
 	assert calls['check_in']['api_user_override'] == '123456'
 	assert calls['check_in']['use_proxy'] is True
+
+
+def test_run_main_add_with_type_flag(monkeypatch):
+	calls = {}
+
+	async def fake_run_profile_add(provider_name, profile_name, auth_type='github'):
+		calls['add'] = (provider_name, profile_name, auth_type)
+		return 0
+
+	monkeypatch.setattr(checkin, 'run_profile_add', fake_run_profile_add)
+
+	monkeypatch.setattr(checkin.sys, 'argv', ['checkin-agentrouter', 'add', 'mkr-ld', '--type', 'linuxdo'])
+	with pytest.raises(SystemExit) as exc_info:
+		checkin.run_main()
+	assert exc_info.value.code == 0
+	assert calls['add'] == ('agentrouter', 'mkr-ld', 'linuxdo')
+
+	monkeypatch.setattr(checkin.sys, 'argv', ['checkin-agentrouter', 'add', 'mkr-ld2', 'linuxdo'])
+	with pytest.raises(SystemExit) as exc_info:
+		checkin.run_main()
+	assert exc_info.value.code == 0
+	assert calls['add'] == ('agentrouter', 'mkr-ld2', 'linuxdo')

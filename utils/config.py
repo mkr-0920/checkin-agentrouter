@@ -8,7 +8,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Literal
 
-from utils.profiles import validate_profile_name
+from utils.profiles import read_profile_marker, validate_profile_name
 
 
 @dataclass
@@ -275,10 +275,12 @@ def load_agentrouter_profile_accounts() -> list[AccountConfig]:
 		except ValueError as exc:
 			print(f'ERROR: AGENTROUTER_ACCOUNTS item {index + 1}: {exc}')
 			return []
+		marker = read_profile_marker('agentrouter', profile_name)
+		marker_api_user = marker.get('api_user')
 		accounts.append(
 			AccountConfig(
 				cookies=None,
-				api_user=None,
+				api_user=str(marker_api_user) if marker_api_user else None,
 				provider='agentrouter',
 				name=profile_name,
 				github_browser=True,
