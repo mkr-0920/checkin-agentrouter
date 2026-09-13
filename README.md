@@ -78,14 +78,23 @@ curl -I --proxy http://127.0.0.1:7890 https://agentrouter.org
 
 ### 3. 添加账号
 
-支持添加 **GitHub** 账号或 **LINUX DO** 账号：
+支持添加 **GitHub** 账号或 **LINUX DO** 账号。
+
+在无图形界面的 Linux 服务器上，可以使用内置的 `vnc.sh` 一键管理虚拟桌面：
 
 ```bash
-# 添加 GitHub 账号（默认）
-uv run python checkin.py add main
+# 1. 开启虚拟桌面与 VNC 服务
+./vnc.sh start
 
-# 添加 LINUX DO 账号（指定 --type linuxdo）
-uv run python checkin.py add main-linuxdo --type linuxdo
+# 2. 在本地电脑建立 SSH 隧道并用 VNC 客户端连接 127.0.0.1:5900
+# ssh -L 5900:127.0.0.1:5900 user@your-server-ip
+
+# 3. 在服务器终端执行添加账号（会自动弹出浏览器到 VNC 里）：
+DISPLAY=:99 uv run python checkin.py add main                       # 添加 GitHub 账号
+DISPLAY=:99 uv run python checkin.py add main-linuxdo --type linuxdo  # 添加 LINUX DO 账号
+
+# 4. 登录完成后一键关闭 VNC 释放资源
+./vnc.sh stop
 ```
 
 浏览器打开后，在该浏览器中完成对应的第三方平台登录（GitHub 或 LINUX DO）。脚本确认登录成功后会保存该账号 profile，并把账号名称写入 `.env`。
