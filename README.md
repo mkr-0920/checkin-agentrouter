@@ -1,8 +1,8 @@
 # AgentRouter 自动签到（checkin-agentrouter）
 
-AgentRouter 自动签到脚本，支持本地多账号每日签到、GitHub OAuth、签到前后余额查询、实时进度条和飞书通知。项目为每个账号独立保存 GitHub 登录状态，每次执行时重新完成 GitHub OAuth，从而触发 AgentRouter 每日签到。
+AgentRouter 自动签到脚本，支持本地多账号每日签到、GitHub OAuth、签到前后余额查询、实时进度条和飞书 / Telegram 通知。项目为每个账号独立保存 GitHub 登录状态，每次执行时重新完成 GitHub OAuth，从而触发 AgentRouter 每日签到。
 
-English summary: Local AgentRouter daily check-in automation with multi-account GitHub OAuth, balance tracking, Rich progress and Feishu notifications.
+English summary: Local AgentRouter daily check-in automation with multi-account GitHub OAuth, balance tracking, Rich progress and Feishu / Telegram notifications.
 
 ## 功能
 
@@ -12,7 +12,7 @@ English summary: Local AgentRouter daily check-in automation with multi-account 
 - 签到前、签到后余额分别重试，不因余额查询失败重复 OAuth
 - 交互终端使用实时多账号进度条
 - 非交互终端使用普通逐行日志，适合 `launchd` 和日志文件
-- 飞书通知余额、签到增量和失败原因
+- 飞书 / Telegram 通知余额、签到增量和失败原因
 - 仅在浏览器明确进入 GitHub 登录页时标记登录过期
 - 调试模式保存详细日志和失败截图
 
@@ -53,6 +53,11 @@ PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org","use_proxy":true}}
 
 # 可选：配置后发送签到结果到飞书
 # FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/replace-with-your-token
+
+# 可选：配置后发送签到结果到 Telegram，两个变量需要同时填写
+# Telegram 通知走 CHECKIN_PROXY_URL，api.telegram.org 无法直连
+# TELEGRAM_BOT_TOKEN=123456:replace-with-your-bot-token
+# TELEGRAM_CHAT_ID=replace-with-your-chat-id
 
 # 可选：每次运行都发送通知。默认 false，只在失败、首次运行或余额变化时通知
 # ALWAYS_NOTIFY=false
@@ -232,6 +237,8 @@ checkin-agentrouter delete main
 | --- | --- | --- |
 | `AGENTROUTER_ACCOUNTS` | 无 | AgentRouter 账号名称数组 |
 | `FEISHU_WEBHOOK` | 无 | 飞书机器人 Webhook |
+| `TELEGRAM_BOT_TOKEN` | 无 | Telegram 机器人 Token |
+| `TELEGRAM_CHAT_ID` | 无 | Telegram 接收通知的会话 ID |
 | `CHECKIN_PROXY_URL` | 无 | AgentRouter 和 GitHub OAuth 使用的 HTTP 代理 |
 | `PROVIDERS` | 内置配置 | AgentRouter 地址和代理开关 |
 | `CHECKIN_CONCURRENCY` | `3` | 同时执行的账号数 |
@@ -248,7 +255,11 @@ PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org","use_proxy":true}}
 
 签到脚本读取的是本地代理地址 `CHECKIN_PROXY_URL`，不读取代理订阅链接。
 
-## 飞书通知
+## 通知
+
+支持飞书和 Telegram。可以只配置其中一个，也可以同时配置：两个都配置时同一份签到结果会分别发送，其中一个发送失败不影响另一个。
+
+### 飞书
 
 配置 Webhook：
 
@@ -256,7 +267,28 @@ PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org","use_proxy":true}}
 FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/replace-with-your-token
 ```
 
-通知示例：
+### Telegram
+
+1. 在 Telegram 中找到 `@BotFather`，发送 `/newbot`，按提示创建机器人并保存返回的 Token
+2. 在 Telegram 中给该机器人发送一条消息
+3. 打开 `https://api.telegram.org/bot<你的 Token>/getUpdates`，在返回的 JSON 中读取 `chat.id`（群聊的 ID 是负数）
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456:replace-with-your-bot-token
+TELEGRAM_CHAT_ID=replace-with-your-chat-id
+```
+
+两个变量需要同时填写才会发送 Telegram 通知。机器人 Token 等同于密码，不要提交到 Git 或发送给他人。
+
+`api.telegram.org` 无法直连，Telegram 通知复用签到脚本的 `CHECKIN_PROXY_URL`。如果 `getUpdates` 打不开，在命令前加上同一个代理：
+
+```bash
+curl "https://api.telegram.org/bot<你的 Token>/getUpdates" --proxy http://127.0.0.1:7890
+```
+
+发送时缺少 `CHECKIN_PROXY_URL` 会打印 `[WARN] Telegram: CHECKIN_PROXY_URL not set` 并尝试直连，国内网络下会超时。飞书通知不经过该代理。
+
+### 通知示例
 
 ```text
 每日签到成功
@@ -368,7 +400,7 @@ uv run python -m cloakbrowser install
 - `.venv/`
 - coverage 和缓存目录
 
-仓库是公开的，提交前确认没有包含登录信息、飞书 Webhook 或代理配置。
+仓库是公开的，提交前确认没有包含登录信息、飞书 Webhook、Telegram Token 或代理配置。
 
 ## 开发和测试
 
